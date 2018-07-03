@@ -3348,8 +3348,11 @@ NVM_API int nvm_send_device_passthrough_cmd(const NVM_UID		device_uid,
 	cmd->LargeOutputPayloadSize = p_cmd->large_output_payload_size;
 	CopyMem(cmd->LargeInputPayload, p_cmd->large_input_payload, cmd->LargeInputPayloadSize);
 
-	if (EFI_SUCCESS == PassThruCommand(cmd, PT_TIMEOUT_INTERVAL))
+	if (EFI_SUCCESS == PassThruCommand(cmd, PT_TIMEOUT_INTERVAL)) {
 		rc = NVM_SUCCESS;
+		CopyMem(p_cmd->output_payload, cmd->OutPayload, p_cmd->output_payload_size);
+		CopyMem(p_cmd->large_output_payload, cmd->LargeOutputPayload, p_cmd->large_output_payload_size);
+	}
 
 finish:
 	FREE_POOL_SAFE(cmd);
