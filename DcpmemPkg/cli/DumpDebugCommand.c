@@ -25,7 +25,7 @@ struct Command DumpDebugCommandSyntax =
   },
   {
     {DEBUG_TARGET, L"", L"", TRUE, ValueEmpty},
-    {DIMM_TARGET, L"", HELP_TEXT_DIMM_ID, TRUE, ValueRequired}
+    {DIMM_TARGET, L"", HELP_TEXT_DIMM_ID, TRUE, ValueOptional}
   },
   {{L"", L"", L"", FALSE, ValueOptional}},                          //!< properties
   L"Dump firmware debug log",                                       //!< help
@@ -74,6 +74,7 @@ DumpDebugCommand(
   UINT64 CurrentDebugBufferSize = 0;
   UINT64 BytesWritten = 0;
   CHAR16 *pDumpUserPath = NULL;
+  CHAR16 *pDumpFullPath = NULL;
   DIMM_INFO *pDimms = NULL;
   BOOLEAN fExists = FALSE;
 
@@ -97,16 +98,31 @@ DumpDebugCommand(
     goto Finish;
   }
 
-  /** get specific DIMM pid passed in, set it **/
   pTargetValue = GetTargetValue(pCmd, DIMM_TARGET);
-  ReturnCode = GetDimmIdsFromString(pTargetValue, pDimms, DimmCount, &pDimmIdsFilter, &DimmIdsFilterNum);
-  if (EFI_ERROR(ReturnCode) || (pDimmIdsFilter == NULL)) {
-    NVDIMM_WARN("Target value is not a valid Dimm ID");
-    goto Finish;
+  if (pTargetValue != NULL && StrLen(pTargetValue) > 0) {
+    /** get specific DIMM pid passed in, set it **/
+    ReturnCode = GetDimmIdsFromString(pTargetValue, pDimms, DimmCount, &pDimmIdsFilter, &DimmIdsFilterNum);
+    if (EFI_ERROR(ReturnCode) || (pDimmIdsFilter == NULL)) {
+      NVDIMM_WARN("Target value is not a valid Dimm ID");
+      goto Finish;
+    }
+  } else {
+    /** If no dimm IDs are specified get IDs from all dimms **/
+    ReturnCode = GetManageableDimmsNumberAndId(&DimmIdsFilterNum, &pDimmIdsFilter);
+    if (EFI_ERROR(ReturnCode)) {
+      Print(FORMAT_STR_NL, CLI_ERR_INTERNAL_ERROR);
+      goto Finish;
+    }
+    if (DimmCount == 0) {
+      Print(FORMAT_STR_NL, CLI_INFO_NO_MANAGEABLE_DIMMS);
+      ReturnCode = EFI_NOT_FOUND;
+      goto Finish;
+    }
   }
-  if (DimmIdsFilterNum > 1) {
-    NVDIMM_WARN("Target value is not a valid Dimm ID");
-    Print(FORMAT_STR_NL, CLI_ERR_INCORRECT_VALUE_TARGET_DIMM);
+
+  ReturnCode = InitializeCommandStatus(&pCommandStatus);
+  if (EFI_ERROR(ReturnCode)) {
+    ReturnCode = EFI_DEVICE_ERROR;
     goto Finish;
   }
 
@@ -130,48 +146,59 @@ DumpDebugCommand(
     goto Finish;
   }
 
-  ReturnCode = FileExists(pDumpUserPath, &fExists);
-  if (!EFI_ERROR(ReturnCode) && fExists){
-     Print(L"Error: File (" FORMAT_STR L") already exists.\n", pDumpUserPath);
-     ReturnCode = EFI_INVALID_PARAMETER;
-     goto Finish;
-   }
-
-  ReturnCode = InitializeCommandStatus(&pCommandStatus);
-  if (EFI_ERROR(ReturnCode)) {
-    ReturnCode = EFI_DEVICE_ERROR;
-    goto Finish;
-  }
-
-  BytesWritten = 0;
-
-  ReturnCode = pNvmDimmConfigProtocol->DumpFwDebugLog(pNvmDimmConfigProtocol,
-      pDimmIdsFilter[0], &pDebugBuffer, &BytesWritten, pCommandStatus);
-
-  if (EFI_ERROR(ReturnCode)) {
-    if (pCommandStatus->GeneralStatus != NVM_SUCCESS) {
-      ReturnCode = MatchCliReturnCode(pCommandStatus->GeneralStatus);
-      DisplayCommandStatus(CLI_INFO_DUMP_DEBUG_LOG, L"", pCommandStatus);
-      goto Finish;
+  for (int i = 0; i<DimmIdsFilterNum; i++) {
+    DIMM_INFO *cDimm = NULL;
+    for (int j = 0; j < DimmCount; j++) {
+      if (pDimms[j].DimmID == pDimmIdsFilter[i]) {
+        cDimm = &pDimms[j];
+        break;
+      }
     }
-  }
 
-  /** Get Fw debug log  **/
-  ReturnCode = DumpToFile(pDumpUserPath, BytesWritten, pDebugBuffer, FALSE);
-  if (EFI_ERROR(ReturnCode)) {
-    if (ReturnCode == EFI_VOLUME_FULL) {
-      Print(L"Not enough space to save file " FORMAT_STR L" with size %d\n", pDumpUserPath, CurrentDebugBufferSize);
+    FREE_POOL_SAFE(pDumpFullPath);
+    FREE_POOL_SAFE(pDebugBuffer);
+
+    pDumpFullPath = CatSPrint(pDumpUserPath, L"/" FORMAT_STR L".bin", cDimm->DimmUid);
+
+    ReturnCode = FileExists(pDumpFullPath, &fExists);
+    Print(L"FileExists %ls %d %d\n", pDumpFullPath, fExists, ReturnCode);
+    if (!EFI_ERROR(ReturnCode) && fExists){
+       Print(L"Error: File (" FORMAT_STR L") already exists.\n", pDumpFullPath);
+       ReturnCode = EFI_INVALID_PARAMETER;
+       goto Finish;
+     }
+
+    BytesWritten = 0;
+
+    ReturnCode = pNvmDimmConfigProtocol->DumpFwDebugLog(pNvmDimmConfigProtocol,
+        cDimm->DimmID, &pDebugBuffer, &BytesWritten, pCommandStatus);
+
+    if (EFI_ERROR(ReturnCode)) {
+      if (pCommandStatus->GeneralStatus != NVM_SUCCESS) {
+        ReturnCode = MatchCliReturnCode(pCommandStatus->GeneralStatus);
+        DisplayCommandStatus(CLI_INFO_DUMP_DEBUG_LOG, L"", pCommandStatus);
+        goto Finish;
+      }
+    }
+
+    /** Get Fw debug log  **/
+    ReturnCode = DumpToFile(pDumpFullPath, BytesWritten, pDebugBuffer, FALSE);
+    if (EFI_ERROR(ReturnCode)) {
+      if (ReturnCode == EFI_VOLUME_FULL) {
+        Print(L"Not enough space to save file " FORMAT_STR L" with size %d\n", pDumpFullPath, CurrentDebugBufferSize);
+      } else {
+        Print(L"Failed to dump FW Debug logs to file (" FORMAT_STR L")\n", pDumpFullPath);
+      }
     } else {
-      Print(L"Failed to dump FW Debug logs to file (" FORMAT_STR L")\n", pDumpUserPath);
+      Print(L"Successfully dumped FW Debug logs to file (" FORMAT_STR L"). (%d) MiB were written.\n",
+          pDumpFullPath, BYTES_TO_MIB(BytesWritten));
     }
-  } else {
-    Print(L"Successfully dumped FW Debug logs to file (" FORMAT_STR L"). (%d) MiB were written.\n",
-        pDumpUserPath, BYTES_TO_MIB(BytesWritten));
   }
 
 Finish:
   FREE_POOL_SAFE(pDimms);
   FREE_POOL_SAFE(pDumpUserPath);
+  FREE_POOL_SAFE(pDumpFullPath);
   FREE_POOL_SAFE(pDimmIdsFilter);
   FREE_POOL_SAFE(pDebugBuffer);
   FreeCommandStatus(&pCommandStatus);
